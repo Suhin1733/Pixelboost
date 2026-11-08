@@ -1,0 +1,1612 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Generate project files
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'PB_END_OF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.pixelboost.app"
+              compileSdk = 34
+              ndkVersion = "26.1.10909125"
+
+              defaultConfig {
+                  applicationId = "com.pixelboost.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+
+                  ndk {
+                      abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+                  }
+                  externalNativeBuild {
+                      cmake {
+                          cppFlags += "-std=c++17"
+                      }
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+              externalNativeBuild {
+                  cmake {
+                      path = file("src/main/cpp/CMakeLists.txt")
+                      version = "3.22.1"
+                  }
+              }
+              androidResources {
+                  noCompress += listOf("param", "bin")
+              }
+              packaging {
+                  resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.2")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.exifinterface:exifinterface:1.3.7")
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app'
+          : > 'app/proguard-rules.pro'
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'PB_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature
+                  android:name="android.hardware.vulkan.version"
+                  android:required="false" />
+
+              <uses-permission
+                  android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:largeHeap="true"
+                  android:theme="@style/Theme.PixelBoost">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/CMakeLists.txt' <<'PB_END_OF_FILE'
+          cmake_minimum_required(VERSION 3.18)
+          project(pixelboost)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fopenmp")
+          set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fopenmp -static-openmp")
+
+          # ncnn prebuilt (downloaded by the GitHub Actions workflow into ./ncnn)
+          set(ncnn_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ncnn/${ANDROID_ABI}/lib/cmake/ncnn)
+          find_package(ncnn REQUIRED)
+
+          add_library(pixelboost SHARED upscaler.cpp)
+          target_link_libraries(pixelboost ncnn jnigraphics android log)
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/upscaler.cpp' <<'PB_END_OF_FILE'
+          // PixelBoost native engine: Real-ESRGAN (ncnn + Vulkan) tiled upscaling for Android bitmaps.
+          #include <jni.h>
+          #include <android/asset_manager_jni.h>
+          #include <android/bitmap.h>
+          #include <android/log.h>
+
+          #include <algorithm>
+          #include <cmath>
+          #include <cstring>
+          #include <string>
+          #include <vector>
+
+          #include "net.h"
+          #include "gpu.h"
+
+          #define LOG_TAG "PixelBoost"
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          namespace {
+
+          const int kPrePadding = 10;
+
+          // Bilinear upscale of the alpha channel (the AI model only handles RGB).
+          void upscaleAlpha(const std::vector<unsigned char>& rgba, int w, int h,
+                            unsigned char* outPix, size_t outStride, int scale) {
+              const int ow = w * scale;
+              const int oh = h * scale;
+              std::vector<int> xi0(ow), xi1(ow);
+              std::vector<float> xa(ow);
+              for (int x = 0; x < ow; x++) {
+                  float fx = (x + 0.5f) / scale - 0.5f;
+                  int x0 = (int)std::floor(fx);
+                  xa[x] = fx - x0;
+                  xi0[x] = std::min(std::max(x0, 0), w - 1);
+                  xi1[x] = std::min(std::max(x0 + 1, 0), w - 1);
+              }
+              for (int y = 0; y < oh; y++) {
+                  float fy = (y + 0.5f) / scale - 0.5f;
+                  int y0 = (int)std::floor(fy);
+                  float ay = fy - y0;
+                  int y1 = std::min(std::max(y0 + 1, 0), h - 1);
+                  y0 = std::min(std::max(y0, 0), h - 1);
+                  const unsigned char* r0 = rgba.data() + (size_t)y0 * w * 4 + 3;
+                  const unsigned char* r1 = rgba.data() + (size_t)y1 * w * 4 + 3;
+                  unsigned char* dst = outPix + (size_t)y * outStride;
+                  for (int x = 0; x < ow; x++) {
+                      float a00 = r0[xi0[x] * 4], a10 = r0[xi1[x] * 4];
+                      float a01 = r1[xi0[x] * 4], a11 = r1[xi1[x] * 4];
+                      float top = a00 + (a10 - a00) * xa[x];
+                      float bot = a01 + (a11 - a01) * xa[x];
+                      float a = top + (bot - top) * ay + 0.5f;
+                      dst[x * 4 + 3] = (unsigned char)std::min(255.0f, std::max(0.0f, a));
+                  }
+              }
+          }
+
+          // returns 0 ok, -1 error, -2 cancelled
+          int runUpscale(JNIEnv* env, AAssetManager* mgr, const std::string& model, int scale, int tile,
+                         bool useGpu, const unsigned char* inPix, size_t inStride, unsigned char* outPix,
+                         size_t outStride, int w, int h, bool hasAlpha, jobject cb, jmethodID cbMethod) {
+              // Tightly packed copy of the input.
+              std::vector<unsigned char> rgba((size_t)w * h * 4);
+              for (int y = 0; y < h; y++) {
+                  memcpy(rgba.data() + (size_t)y * w * 4, inPix + (size_t)y * inStride, (size_t)w * 4);
+              }
+
+              ncnn::Net net;
+              bool gpu = useGpu && ncnn::get_gpu_count() > 0;
+              net.opt.use_vulkan_compute = gpu;
+              if (gpu) {
+                  net.set_vulkan_device(ncnn::get_default_gpu_index());
+                  net.opt.use_fp16_packed = true;
+                  net.opt.use_fp16_storage = true;
+                  net.opt.use_fp16_arithmetic = false;
+              }
+
+              std::string base = "models/" + model;
+              if (net.load_param(mgr, (base + ".param").c_str()) != 0) {
+                  LOGE("load_param failed: %s", base.c_str());
+                  return -1;
+              }
+              if (net.load_model(mgr, (base + ".bin").c_str()) != 0) {
+                  LOGE("load_model failed: %s", base.c_str());
+                  return -1;
+              }
+
+              const int tilesX = (w + tile - 1) / tile;
+              const int tilesY = (h + tile - 1) / tile;
+              const int total = tilesX * tilesY;
+              int done = 0;
+
+              const float norm1[3] = {1 / 255.f, 1 / 255.f, 1 / 255.f};
+              const float norm255[3] = {255.f, 255.f, 255.f};
+
+              for (int ty = 0; ty < tilesY; ty++) {
+                  for (int tx = 0; tx < tilesX; tx++) {
+                      const int x0 = tx * tile, y0 = ty * tile;
+                      const int x1 = std::min(x0 + tile, w), y1 = std::min(y0 + tile, h);
+                      const int px0 = std::max(x0 - kPrePadding, 0), py0 = std::max(y0 - kPrePadding, 0);
+                      const int px1 = std::min(x1 + kPrePadding, w), py1 = std::min(y1 + kPrePadding, h);
+
+                      ncnn::Mat in = ncnn::Mat::from_pixels_roi(rgba.data(), ncnn::Mat::PIXEL_RGBA2RGB, w, h,
+                                                                px0, py0, px1 - px0, py1 - py0);
+                      in.substract_mean_normalize(0, norm1);
+
+                      ncnn::Mat out;
+                      {
+                          ncnn::Extractor ex = net.create_extractor();
+                          if (ex.input("data", in) != 0) return -1;
+                          if (ex.extract("output", out) != 0) {
+                              LOGE("extract failed at tile %d,%d", tx, ty);
+                              return -1;
+                          }
+                      }
+                      out.substract_mean_normalize(0, norm255);
+
+                      std::vector<unsigned char> tmp((size_t)out.w * out.h * 4);
+                      out.to_pixels(tmp.data(), ncnn::Mat::PIXEL_RGB2RGBA);
+
+                      const int cropL = (x0 - px0) * scale;
+                      const int cropT = (y0 - py0) * scale;
+                      const int cw = (x1 - x0) * scale;
+                      const int ch = (y1 - y0) * scale;
+                      for (int r = 0; r < ch; r++) {
+                          memcpy(outPix + (size_t)(y0 * scale + r) * outStride + (size_t)x0 * scale * 4,
+                                 tmp.data() + ((size_t)(cropT + r) * out.w + cropL) * 4, (size_t)cw * 4);
+                      }
+
+                      done++;
+                      jboolean cont = env->CallBooleanMethod(cb, cbMethod, (jint)done, (jint)total);
+                      if (env->ExceptionCheck()) {
+                          env->ExceptionClear();
+                          return -1;
+                      }
+                      if (!cont) return -2;
+                  }
+              }
+
+              if (hasAlpha) {
+                  bool any = false;
+                  for (size_t i = 3; i < rgba.size(); i += 4) {
+                      if (rgba[i] != 255) { any = true; break; }
+                  }
+                  if (any) upscaleAlpha(rgba, w, h, outPix, outStride, scale);
+              }
+              return 0;
+          }
+
+          }  // namespace
+
+          extern "C" {
+
+          JNIEXPORT jint JNI_OnLoad(JavaVM*, void*) {
+              ncnn::create_gpu_instance();
+              return JNI_VERSION_1_4;
+          }
+
+          JNIEXPORT void JNI_OnUnload(JavaVM*, void*) {
+              ncnn::destroy_gpu_instance();
+          }
+
+          JNIEXPORT jint JNICALL
+          Java_com_pixelboost_app_NativeUpscaler_gpuCount(JNIEnv*, jobject) {
+              return ncnn::get_gpu_count();
+          }
+
+          JNIEXPORT jint JNICALL
+          Java_com_pixelboost_app_NativeUpscaler_upscale(JNIEnv* env, jobject, jobject assetManager,
+                                                         jstring jModel, jint scale, jint tileSize,
+                                                         jboolean useGpu, jobject bmpIn, jobject bmpOut,
+                                                         jboolean hasAlpha, jobject callback) {
+              AndroidBitmapInfo inInfo, outInfo;
+              if (AndroidBitmap_getInfo(env, bmpIn, &inInfo) < 0) return -1;
+              if (AndroidBitmap_getInfo(env, bmpOut, &outInfo) < 0) return -1;
+              if (inInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888 ||
+                  outInfo.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return -1;
+              const int w = (int)inInfo.width, h = (int)inInfo.height;
+              if ((int)outInfo.width != w * scale || (int)outInfo.height != h * scale) return -1;
+
+              jclass cbClass = env->FindClass("com/pixelboost/app/ProgressCallback");
+              if (cbClass == nullptr) return -1;
+              jmethodID cbMethod = env->GetMethodID(cbClass, "onProgress", "(II)Z");
+              if (cbMethod == nullptr) return -1;
+
+              AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
+              const char* modelChars = env->GetStringUTFChars(jModel, nullptr);
+              std::string model(modelChars);
+              env->ReleaseStringUTFChars(jModel, modelChars);
+
+              void* inPtr = nullptr;
+              void* outPtr = nullptr;
+              if (AndroidBitmap_lockPixels(env, bmpIn, &inPtr) < 0) return -1;
+              if (AndroidBitmap_lockPixels(env, bmpOut, &outPtr) < 0) {
+                  AndroidBitmap_unlockPixels(env, bmpIn);
+                  return -1;
+              }
+
+              int rc = runUpscale(env, mgr, model, scale, std::max(16, (int)tileSize), useGpu == JNI_TRUE,
+                                  (const unsigned char*)inPtr, inInfo.stride, (unsigned char*)outPtr,
+                                  outInfo.stride, w, h, hasAlpha == JNI_TRUE, callback, cbMethod);
+
+              AndroidBitmap_unlockPixels(env, bmpOut);
+              AndroidBitmap_unlockPixels(env, bmpIn);
+              return rc;
+          }
+
+          }  // extern "C"
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/CompareScreen.kt' <<'PB_END_OF_FILE'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.pixelboost.app
+
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+          import androidx.compose.foundation.gestures.detectTransformGestures
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.BoxWithConstraints
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.fillMaxHeight
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.offset
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.automirrored.filled.ArrowBack
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.produceState
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.clipToBounds
+          import androidx.compose.ui.draw.drawWithContent
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.graphics.drawscope.clipRect
+          import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.platform.LocalDensity
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.IntOffset
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import kotlin.math.roundToInt
+
+          private const val PREVIEW_MAX = 2560
+
+          @Composable
+          fun CompareScreen(item: Item, onBack: () -> Unit) {
+              val context = LocalContext.current
+              val pair by produceState<Pair<Bitmap, Bitmap>?>(null, item.id) {
+                  value = withContext(Dispatchers.IO) {
+                      try {
+                          val saved = item.savedUri ?: return@withContext null
+                          val after = ImageIO.decode(context, saved, PREVIEW_MAX) ?: return@withContext null
+                          val before0 = ImageIO.decode(context, item.uri, PREVIEW_MAX) ?: return@withContext null
+                          val before = if (before0.width == after.width && before0.height == after.height) before0
+                          else Bitmap.createScaledBitmap(before0, after.width, after.height, true)
+                          before to after
+                      } catch (e: Throwable) {
+                          null
+                      }
+                  }
+              }
+              val canShare = item.savedUri?.scheme == "content"
+
+              Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                  Column(Modifier.fillMaxSize()) {
+                      TopAppBar(
+                          title = { Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                          navigationIcon = {
+                              IconButton(onClick = onBack) {
+                                  Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                              }
+                          },
+                          actions = {
+                              if (canShare) {
+                                  TextButton(onClick = {
+                                      val send = Intent(Intent.ACTION_SEND).apply {
+                                          type = "image/*"
+                                          putExtra(Intent.EXTRA_STREAM, item.savedUri)
+                                          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                      }
+                                      context.startActivity(Intent.createChooser(send, "Share"))
+                                  }) { Text("Share") }
+                              }
+                          }
+                      )
+                      val p = pair
+                      if (p == null) {
+                          Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                              CircularProgressIndicator()
+                          }
+                      } else {
+                          CompareView(p.first, p.second, Modifier.weight(1f).fillMaxWidth())
+                      }
+                      Text(
+                          "Drag the handle to compare - pinch to zoom",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          modifier = Modifier.padding(12.dp)
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun CompareView(before: Bitmap, after: Bitmap, modifier: Modifier = Modifier) {
+              val beforeImg = remember(before) { before.asImageBitmap() }
+              val afterImg = remember(after) { after.asImageBitmap() }
+              var fraction by remember { mutableFloatStateOf(0.5f) }
+              var zoom by remember { mutableFloatStateOf(1f) }
+              var offset by remember { mutableStateOf(Offset.Zero) }
+              val handleWidth = 44.dp
+              val handlePx = with(LocalDensity.current) { handleWidth.toPx() }
+
+              BoxWithConstraints(modifier.background(Color.Black).clipToBounds()) {
+                  val wPx = constraints.maxWidth.toFloat()
+                  val hPx = constraints.maxHeight.toFloat()
+
+                  Box(
+                      Modifier
+                          .fillMaxSize()
+                          .pointerInput(Unit) {
+                              detectTransformGestures { _, pan, gestureZoom, _ ->
+                                  val z = (zoom * gestureZoom).coerceIn(1f, 8f)
+                                  val maxX = (z - 1f) * wPx / 2f
+                                  val maxY = (z - 1f) * hPx / 2f
+                                  zoom = z
+                                  offset = Offset(
+                                      (offset.x + pan.x).coerceIn(-maxX, maxX),
+                                      (offset.y + pan.y).coerceIn(-maxY, maxY)
+                                  )
+                              }
+                          }
+                  ) {
+                      // AFTER (full)
+                      Image(
+                          bitmap = afterImg,
+                          contentDescription = null,
+                          contentScale = ContentScale.Fit,
+                          modifier = Modifier
+                              .fillMaxSize()
+                              .graphicsLayer {
+                                  scaleX = zoom
+                                  scaleY = zoom
+                                  translationX = offset.x
+                                  translationY = offset.y
+                              }
+                      )
+                      // BEFORE (clipped to the left of the divider)
+                      Image(
+                          bitmap = beforeImg,
+                          contentDescription = null,
+                          contentScale = ContentScale.Fit,
+                          modifier = Modifier
+                              .fillMaxSize()
+                              .drawWithContent {
+                                  clipRect(left = 0f, top = 0f, right = size.width * fraction, bottom = size.height) {
+                                      this@drawWithContent.drawContent()
+                                  }
+                              }
+                              .graphicsLayer {
+                                  scaleX = zoom
+                                  scaleY = zoom
+                                  translationX = offset.x
+                                  translationY = offset.y
+                              }
+                      )
+                  }
+
+                  Label("BEFORE", Modifier.align(Alignment.TopStart))
+                  Label("AFTER", Modifier.align(Alignment.TopEnd))
+
+                  // Divider + draggable handle
+                  Box(
+                      Modifier
+                          .offset { IntOffset((fraction * wPx - handlePx / 2f).roundToInt(), 0) }
+                          .width(handleWidth)
+                          .fillMaxHeight()
+                          .pointerInput(Unit) {
+                              detectHorizontalDragGestures { change, dragAmount ->
+                                  change.consume()
+                                  fraction = (fraction + dragAmount / wPx).coerceIn(0f, 1f)
+                              }
+                          },
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Box(
+                          Modifier
+                              .width(2.dp)
+                              .fillMaxHeight()
+                              .background(Color.White)
+                      )
+                      Box(
+                          Modifier
+                              .size(36.dp)
+                              .clip(CircleShape)
+                              .background(Color.White),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text("<>", color = Color.Black, fontSize = 14.sp)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Label(text: String, modifier: Modifier) {
+              Text(
+                  text,
+                  color = Color.White,
+                  fontSize = 11.sp,
+                  modifier = modifier
+                      .padding(8.dp)
+                      .clip(CircleShape)
+                      .background(Color(0x99000000))
+                      .padding(horizontal = 10.dp, vertical = 4.dp)
+              )
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/ImageIO.kt' <<'PB_END_OF_FILE'
+          package com.pixelboost.app
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Matrix
+          import android.media.MediaScannerConnection
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import androidx.exifinterface.media.ExifInterface
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.io.IOException
+          import kotlin.math.max
+          import kotlin.math.roundToInt
+
+          object ImageIO {
+
+              private fun exifMatrix(context: Context, uri: Uri): Matrix? {
+                  val orientation = try {
+                      context.contentResolver.openInputStream(uri)?.use {
+                          ExifInterface(it).getAttributeInt(
+                              ExifInterface.TAG_ORIENTATION,
+                              ExifInterface.ORIENTATION_NORMAL
+                          )
+                      } ?: ExifInterface.ORIENTATION_NORMAL
+                  } catch (e: Exception) {
+                      ExifInterface.ORIENTATION_NORMAL
+                  }
+                  val m = Matrix()
+                  when (orientation) {
+                      ExifInterface.ORIENTATION_ROTATE_90 -> m.postRotate(90f)
+                      ExifInterface.ORIENTATION_ROTATE_180 -> m.postRotate(180f)
+                      ExifInterface.ORIENTATION_ROTATE_270 -> m.postRotate(270f)
+                      ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> m.postScale(-1f, 1f)
+                      ExifInterface.ORIENTATION_FLIP_VERTICAL -> m.postScale(1f, -1f)
+                      ExifInterface.ORIENTATION_TRANSPOSE -> { m.postRotate(90f); m.postScale(-1f, 1f) }
+                      ExifInterface.ORIENTATION_TRANSVERSE -> { m.postRotate(270f); m.postScale(-1f, 1f) }
+                      else -> return null
+                  }
+                  return m
+              }
+
+              /** Decode an image. If maxSide > 0 the result is limited to that size (longest side). */
+              fun decode(context: Context, uri: Uri, maxSide: Int = 0): Bitmap? {
+                  val resolver = context.contentResolver
+                  var sample = 1
+                  if (maxSide > 0) {
+                      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                      resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                      val longest = max(bounds.outWidth, bounds.outHeight)
+                      while (longest > 0 && longest / (sample * 2) >= maxSide) sample *= 2
+                  }
+                  val opts = BitmapFactory.Options().apply {
+                      inSampleSize = sample
+                      inPreferredConfig = Bitmap.Config.ARGB_8888
+                      inPremultiplied = false
+                  }
+                  var bmp = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+                      ?: return null
+
+                  val m = exifMatrix(context, uri)
+                  if (m != null) {
+                      try {
+                          val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                          if (rotated !== bmp) bmp.recycle()
+                          bmp = rotated
+                      } catch (e: OutOfMemoryError) {
+                          // keep unrotated
+                      }
+                  }
+                  if (maxSide > 0 && max(bmp.width, bmp.height) > maxSide) {
+                      val f = maxSide.toFloat() / max(bmp.width, bmp.height)
+                      val scaled = Bitmap.createScaledBitmap(
+                          bmp,
+                          max(1, (bmp.width * f).roundToInt()),
+                          max(1, (bmp.height * f).roundToInt()),
+                          true
+                      )
+                      if (scaled !== bmp) bmp.recycle()
+                      bmp = scaled
+                  }
+                  return bmp
+              }
+
+              fun displayName(context: Context, uri: Uri): String {
+                  var name: String? = null
+                  try {
+                      context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                          ?.use { c -> if (c.moveToFirst()) name = c.getString(0) }
+                  } catch (e: Exception) {
+                  }
+                  return name ?: "image"
+              }
+
+              private fun flattenOnWhite(src: Bitmap): Bitmap {
+                  val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(out)
+                  c.drawColor(Color.WHITE)
+                  c.drawBitmap(src, 0f, 0f, null)
+                  return out
+              }
+
+              @Suppress("DEPRECATION")
+              fun save(context: Context, bmp: Bitmap, baseName: String, format: OutFormat, hasAlpha: Boolean): Uri {
+                  val toSave = if (format == OutFormat.JPG && hasAlpha) flattenOnWhite(bmp) else bmp
+                  val cf = when (format) {
+                      OutFormat.PNG -> Bitmap.CompressFormat.PNG
+                      OutFormat.JPG -> Bitmap.CompressFormat.JPEG
+                      OutFormat.WEBP ->
+                          if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY
+                          else Bitmap.CompressFormat.WEBP
+                  }
+                  val fileName = "$baseName.${format.ext}"
+
+                  try {
+                      if (Build.VERSION.SDK_INT >= 29) {
+                          val resolver = context.contentResolver
+                          val values = ContentValues().apply {
+                              put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                              put(MediaStore.Images.Media.MIME_TYPE, format.mime)
+                              put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PixelBoost")
+                              put(MediaStore.Images.Media.IS_PENDING, 1)
+                          }
+                          val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                              ?: throw IOException("Cannot create file")
+                          var ok = false
+                          resolver.openOutputStream(uri)?.use { ok = toSave.compress(cf, 95, it) }
+                          if (!ok) {
+                              resolver.delete(uri, null, null)
+                              throw IOException("Cannot write image")
+                          }
+                          values.clear()
+                          values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                          resolver.update(uri, values, null, null)
+                          return uri
+                      } else {
+                          val dir = File(
+                              Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                              "PixelBoost"
+                          )
+                          dir.mkdirs()
+                          var file = File(dir, fileName)
+                          var i = 1
+                          while (file.exists()) {
+                              file = File(dir, "${baseName}_$i.${format.ext}")
+                              i++
+                          }
+                          FileOutputStream(file).use { toSave.compress(cf, 95, it) }
+                          MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), arrayOf(format.mime), null)
+                          return Uri.fromFile(file)
+                      }
+                  } finally {
+                      if (toSave !== bmp) toSave.recycle()
+                  }
+              }
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/MainActivity.kt' <<'PB_END_OF_FILE'
+          package com.pixelboost.app
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Surface
+          import androidx.compose.ui.Modifier
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      PixelBoostTheme {
+                          Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                              App()
+                          }
+                      }
+                  }
+              }
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/MainViewModel.kt' <<'PB_END_OF_FILE'
+          package com.pixelboost.app
+
+          import android.app.Application
+          import android.net.Uri
+          import androidx.lifecycle.AndroidViewModel
+          import androidx.lifecycle.viewModelScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.flow.update
+          import kotlinx.coroutines.launch
+
+          class MainViewModel(app: Application) : AndroidViewModel(app) {
+
+              private val appContext = app.applicationContext
+              private val engine = UpscaleEngine(appContext)
+              private var nextId = 1L
+
+              private val _items = MutableStateFlow<List<Item>>(emptyList())
+              val items: StateFlow<List<Item>> = _items.asStateFlow()
+
+              private val _settings = MutableStateFlow(UpscaleSettings())
+              val settings: StateFlow<UpscaleSettings> = _settings.asStateFlow()
+
+              private val _running = MutableStateFlow(false)
+              val running: StateFlow<Boolean> = _running.asStateFlow()
+
+              val gpuAvailable: Boolean = runCatching { NativeUpscaler.gpuCount() > 0 }.getOrDefault(false)
+
+              init {
+                  if (!gpuAvailable) _settings.update { it.copy(useGpu = false) }
+              }
+
+              fun updateSettings(f: (UpscaleSettings) -> UpscaleSettings) {
+                  _settings.update(f)
+              }
+
+              fun addImages(uris: List<Uri>) {
+                  if (uris.isEmpty()) return
+                  val existing = _items.value.map { it.uri }.toSet()
+                  val newItems = uris.filter { it !in existing }.map {
+                      Item(id = nextId++, uri = it, name = ImageIO.displayName(appContext, it))
+                  }
+                  _items.update { it + newItems }
+              }
+
+              fun removeItem(id: Long) {
+                  _items.update { list -> list.filter { it.id != id } }
+              }
+
+              fun clearAll() {
+                  if (_running.value) return
+                  _items.value = emptyList()
+              }
+
+              fun cancel() {
+                  engine.cancelled = true
+              }
+
+              private fun patch(id: Long, f: (Item) -> Item) {
+                  _items.update { list -> list.map { if (it.id == id) f(it) else it } }
+              }
+
+              fun start() {
+                  if (_running.value) return
+                  val s = _settings.value
+                  engine.cancelled = false
+                  _running.value = true
+                  viewModelScope.launch(Dispatchers.Default) {
+                      try {
+                          val queue = _items.value.filter { it.status != Status.Done }.map { it.id }
+                          for (id in queue) {
+                              if (engine.cancelled) break
+                              val item = _items.value.firstOrNull { it.id == id } ?: continue
+                              patch(id) { it.copy(status = Status.Working, progress = 0f, message = null) }
+                              try {
+                                  val bmp = ImageIO.decode(appContext, item.uri)
+                                      ?: throw UpscaleException("Cannot read this image")
+                                  val hasAlpha = bmp.hasAlpha()
+                                  val out = engine.upscale(bmp, s) { p -> patch(id) { it.copy(progress = p) } }
+                                  bmp.recycle()
+                                  val base = item.name.substringBeforeLast('.', item.name) + "_x${s.targetScale}"
+                                  val saved = ImageIO.save(appContext, out.bitmap, base, s.format, hasAlpha)
+                                  val dims = "${out.bitmap.width} x ${out.bitmap.height}"
+                                  out.bitmap.recycle()
+                                  val msg = dims + (out.note?.let { " ($it)" } ?: "")
+                                  patch(id) { it.copy(status = Status.Done, progress = 1f, savedUri = saved, message = msg) }
+                              } catch (e: CancelledException) {
+                                  patch(id) { it.copy(status = Status.Cancelled, progress = 0f) }
+                              } catch (e: Throwable) {
+                                  patch(id) {
+                                      it.copy(status = Status.Failed, message = e.message ?: e.javaClass.simpleName)
+                                  }
+                              }
+                          }
+                      } finally {
+                          _running.value = false
+                      }
+                  }
+              }
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/Models.kt' <<'PB_END_OF_FILE'
+          package com.pixelboost.app
+
+          data class UpscaleModel(
+              val id: String,
+              val title: String,
+              val description: String,
+              val file: String,
+              val nativeScale: Int
+          )
+
+          object Models {
+              val all = listOf(
+                  UpscaleModel("x4plus", "Real-ESRGAN x4 Plus (Photos)", "Best quality for real photos. Slower.", "realesrgan-x4plus", 4),
+                  UpscaleModel("x4anime", "Real-ESRGAN x4 Plus Anime", "Best for drawings, anime and illustrations.", "realesrgan-x4plus-anime", 4),
+                  UpscaleModel("fast4", "Fast x4 (AnimeVideo v3)", "Very fast and light. Good for quick results.", "realesr-animevideov3-x4", 4),
+                  UpscaleModel("fast3", "Fast x3 (AnimeVideo v3)", "Very fast, 3x native.", "realesr-animevideov3-x3", 3),
+                  UpscaleModel("fast2", "Fast x2 (AnimeVideo v3)", "Very fast, 2x native.", "realesr-animevideov3-x2", 2)
+              )
+          }
+
+          enum class OutFormat(val label: String, val ext: String, val mime: String) {
+              PNG("PNG", "png", "image/png"),
+              JPG("JPG", "jpg", "image/jpeg"),
+              WEBP("WEBP", "webp", "image/webp")
+          }
+
+          val SCALE_OPTIONS = listOf(2, 3, 4, 8)
+          val TILE_OPTIONS = listOf(32, 64, 100, 128, 200)
+
+          fun tileLabel(t: Int): String = when (t) {
+              32 -> "32 - lowest memory"
+              100 -> "100 - recommended"
+              200 -> "200 - fastest (needs more RAM)"
+              else -> "$t"
+          }
+
+          data class UpscaleSettings(
+              val model: UpscaleModel = Models.all[0],
+              val targetScale: Int = 4,
+              val tile: Int = 100,
+              val format: OutFormat = OutFormat.PNG,
+              val useGpu: Boolean = true
+          )
+
+          enum class Status { Queued, Working, Done, Failed, Cancelled }
+
+          data class Item(
+              val id: Long,
+              val uri: android.net.Uri,
+              val name: String,
+              val status: Status = Status.Queued,
+              val progress: Float = 0f,
+              val message: String? = null,
+              val savedUri: android.net.Uri? = null
+          )
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/NativeUpscaler.kt' <<'PB_END_OF_FILE'
+          package com.pixelboost.app
+
+          import android.content.res.AssetManager
+          import android.graphics.Bitmap
+
+          fun interface ProgressCallback {
+              /** Return false to cancel. */
+              fun onProgress(done: Int, total: Int): Boolean
+          }
+
+          object NativeUpscaler {
+              init {
+                  System.loadLibrary("pixelboost")
+              }
+
+              external fun gpuCount(): Int
+
+              /** @return 0 = ok, -2 = cancelled, anything else = error */
+              external fun upscale(
+                  assets: AssetManager,
+                  model: String,
+                  scale: Int,
+                  tile: Int,
+                  useGpu: Boolean,
+                  input: Bitmap,
+                  output: Bitmap,
+                  hasAlpha: Boolean,
+                  callback: ProgressCallback
+              ): Int
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/Theme.kt' <<'PB_END_OF_FILE'
+          package com.pixelboost.app
+
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.material3.lightColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+
+          @Composable
+          fun PixelBoostTheme(content: @Composable () -> Unit) {
+              val colors = if (isSystemInDarkTheme()) {
+                  darkColorScheme(
+                      primary = Color(0xFF9CC2FF),
+                      secondary = Color(0xFF7FE0C3),
+                      background = Color(0xFF101418),
+                      surface = Color(0xFF181D23)
+                  )
+              } else {
+                  lightColorScheme(
+                      primary = Color(0xFF1F5FD6),
+                      secondary = Color(0xFF0E8F73),
+                      background = Color(0xFFF6F8FC),
+                      surface = Color(0xFFFFFFFF)
+                  )
+              }
+              MaterialTheme(colorScheme = colors, content = content)
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/Ui.kt' <<'PB_END_OF_FILE'
+          @file:OptIn(ExperimentalMaterial3Api::class)
+
+          package com.pixelboost.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.view.WindowManager
+          import android.widget.Toast
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.ButtonDefaults
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.DropdownMenu
+          import androidx.compose.material3.DropdownMenuItem
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.DisposableEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.produceState
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import androidx.lifecycle.viewmodel.compose.viewModel
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+
+          @Composable
+          fun App(vm: MainViewModel = viewModel()) {
+              val items by vm.items.collectAsStateWithLifecycle()
+              val settings by vm.settings.collectAsStateWithLifecycle()
+              val running by vm.running.collectAsStateWithLifecycle()
+              val context = LocalContext.current
+              var compareItem by remember { mutableStateOf<Item?>(null) }
+
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+                  vm.addImages(uris)
+              }
+              val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                  if (granted) vm.start()
+                  else Toast.makeText(context, "Storage permission is needed to save images", Toast.LENGTH_LONG).show()
+              }
+
+              // Keep the screen on while upscaling.
+              DisposableEffect(running) {
+                  val window = (context as? Activity)?.window
+                  if (running) window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+              }
+
+              fun startClicked() {
+                  if (Build.VERSION.SDK_INT < 29 &&
+                      ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                      != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      permissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                  } else {
+                      vm.start()
+                  }
+              }
+
+              val current = compareItem
+              if (current != null) {
+                  BackHandler { compareItem = null }
+                  CompareScreen(item = current, onBack = { compareItem = null })
+                  return
+              }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(title = {
+                          Column {
+                              Text("PixelBoost", fontWeight = FontWeight.Bold)
+                              Text("AI image upscaler - runs fully offline", style = MaterialTheme.typography.labelSmall)
+                          }
+                      })
+                  },
+                  bottomBar = {
+                      Surface(tonalElevation = 3.dp) {
+                          Row(
+                              Modifier
+                                  .fillMaxWidth()
+                                  .padding(12.dp),
+                              horizontalArrangement = Arrangement.spacedBy(12.dp)
+                          ) {
+                              OutlinedButton(
+                                  onClick = { picker.launch("image/*") },
+                                  enabled = !running,
+                                  modifier = Modifier.weight(1f)
+                              ) { Text("Add images") }
+                              if (running) {
+                                  Button(
+                                      onClick = { vm.cancel() },
+                                      colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                      modifier = Modifier.weight(1f)
+                                  ) { Text("Cancel") }
+                              } else {
+                                  Button(
+                                      onClick = { startClicked() },
+                                      enabled = items.any { it.status != Status.Done },
+                                      modifier = Modifier.weight(1f)
+                                  ) { Text("Upscale") }
+                              }
+                          }
+                      }
+                  }
+              ) { padding ->
+                  LazyColumn(
+                      contentPadding = PaddingValues(
+                          start = 16.dp,
+                          end = 16.dp,
+                          top = padding.calculateTopPadding() + 8.dp,
+                          bottom = padding.calculateBottomPadding() + 16.dp
+                      ),
+                      verticalArrangement = Arrangement.spacedBy(10.dp)
+                  ) {
+                      item {
+                          SettingsCard(settings, vm.gpuAvailable, !running) { f -> vm.updateSettings(f) }
+                      }
+                      item {
+                          Row(
+                              Modifier.fillMaxWidth(),
+                              horizontalArrangement = Arrangement.SpaceBetween,
+                              verticalAlignment = Alignment.CenterVertically
+                          ) {
+                              Text("Images (${items.size})", style = MaterialTheme.typography.titleMedium)
+                              if (items.isNotEmpty() && !running) {
+                                  TextButton(onClick = { vm.clearAll() }) { Text("Clear all") }
+                              }
+                          }
+                      }
+                      if (items.isEmpty()) {
+                          item {
+                              Text(
+                                  "Tap \"Add images\" to choose one or many photos. Results are saved in Pictures/PixelBoost.",
+                                  style = MaterialTheme.typography.bodyMedium,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                  modifier = Modifier.padding(vertical = 24.dp)
+                              )
+                          }
+                      }
+                      items(items, key = { it.id }) { item ->
+                          ItemRow(
+                              item = item,
+                              onRemove = { vm.removeItem(item.id) },
+                              onCompare = { compareItem = item }
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun SettingsCard(
+              settings: UpscaleSettings,
+              gpuAvailable: Boolean,
+              enabled: Boolean,
+              onChange: ((UpscaleSettings) -> UpscaleSettings) -> Unit
+          ) {
+              Card(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                      DropdownField(
+                          label = "AI model",
+                          current = settings.model.title,
+                          options = Models.all,
+                          optionText = { it.title },
+                          enabled = enabled
+                      ) { m -> onChange { it.copy(model = m) } }
+                      Text(
+                          settings.model.description,
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant
+                      )
+
+                      Text("Upscale", style = MaterialTheme.typography.labelMedium)
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          SCALE_OPTIONS.forEach { sc ->
+                              FilterChip(
+                                  selected = settings.targetScale == sc,
+                                  onClick = { onChange { it.copy(targetScale = sc) } },
+                                  enabled = enabled,
+                                  label = { Text("${sc}x") }
+                              )
+                          }
+                      }
+
+                      Text("Save as", style = MaterialTheme.typography.labelMedium)
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutFormat.values().forEach { f ->
+                              FilterChip(
+                                  selected = settings.format == f,
+                                  onClick = { onChange { it.copy(format = f) } },
+                                  enabled = enabled,
+                                  label = { Text(f.label) }
+                              )
+                          }
+                      }
+
+                      DropdownField(
+                          label = "Tile size (smaller = less memory, slower)",
+                          current = tileLabel(settings.tile),
+                          options = TILE_OPTIONS,
+                          optionText = { tileLabel(it) },
+                          enabled = enabled
+                      ) { t -> onChange { it.copy(tile = t) } }
+
+                      Row(
+                          Modifier.fillMaxWidth(),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Column(Modifier.weight(1f)) {
+                              Text("Use GPU (Vulkan)")
+                              Text(
+                                  if (gpuAvailable) "GPU available - much faster" else "No Vulkan GPU found - using CPU (slow)",
+                                  style = MaterialTheme.typography.bodySmall,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant
+                              )
+                          }
+                          Switch(
+                              checked = settings.useGpu && gpuAvailable,
+                              onCheckedChange = { v -> onChange { it.copy(useGpu = v) } },
+                              enabled = enabled && gpuAvailable
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun <T> DropdownField(
+              label: String,
+              current: String,
+              options: List<T>,
+              optionText: (T) -> String,
+              enabled: Boolean,
+              onSelect: (T) -> Unit
+          ) {
+              var expanded by remember { mutableStateOf(false) }
+              Column {
+                  Text(label, style = MaterialTheme.typography.labelMedium)
+                  Box {
+                      OutlinedButton(
+                          onClick = { expanded = true },
+                          enabled = enabled,
+                          modifier = Modifier.fillMaxWidth()
+                      ) {
+                          Text(current, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                          Text("v")
+                      }
+                      DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                          options.forEach { o ->
+                              DropdownMenuItem(
+                                  text = { Text(optionText(o)) },
+                                  onClick = {
+                                      expanded = false
+                                      onSelect(o)
+                                  }
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun ItemRow(item: Item, onRemove: () -> Unit, onCompare: () -> Unit) {
+              val context = LocalContext.current
+              val thumb by produceState<ImageBitmap?>(null, item.uri) {
+                  value = withContext(Dispatchers.IO) {
+                      try {
+                          ImageIO.decode(context, item.uri, 200)?.asImageBitmap()
+                      } catch (e: Throwable) {
+                          null
+                      }
+                  }
+              }
+              Card(Modifier.fillMaxWidth()) {
+                  Row(
+                      Modifier.padding(10.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      Box(
+                          Modifier
+                              .size(64.dp)
+                              .clip(RoundedCornerShape(8.dp))
+                              .background(MaterialTheme.colorScheme.surfaceVariant)
+                      ) {
+                          thumb?.let {
+                              Image(
+                                  bitmap = it,
+                                  contentDescription = null,
+                                  modifier = Modifier.size(64.dp),
+                                  contentScale = ContentScale.Crop
+                              )
+                          }
+                      }
+                      Column(Modifier.weight(1f)) {
+                          Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                          Text(
+                              statusText(item),
+                              style = MaterialTheme.typography.bodySmall,
+                              color = if (item.status == Status.Failed) MaterialTheme.colorScheme.error
+                              else MaterialTheme.colorScheme.onSurfaceVariant
+                          )
+                          if (item.status == Status.Working) {
+                              LinearProgressIndicator(
+                                  progress = { item.progress },
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .padding(top = 6.dp)
+                              )
+                          }
+                      }
+                      if (item.status == Status.Done) {
+                          TextButton(onClick = onCompare) { Text("Compare") }
+                      }
+                      if (item.status != Status.Working) {
+                          IconButton(onClick = onRemove) { Icon(Icons.Default.Close, contentDescription = "Remove") }
+                      }
+                  }
+              }
+          }
+
+          private fun statusText(item: Item): String = when (item.status) {
+              Status.Queued -> "Waiting"
+              Status.Working -> "Upscaling... ${(item.progress * 100).toInt()}%"
+              Status.Done -> "Saved - ${item.message ?: ""}"
+              Status.Failed -> "Failed: ${item.message ?: "unknown error"}"
+              Status.Cancelled -> "Cancelled"
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/java/com/pixelboost/app'
+          cat > 'app/src/main/java/com/pixelboost/app/UpscaleEngine.kt' <<'PB_END_OF_FILE'
+          package com.pixelboost.app
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import kotlin.math.max
+          import kotlin.math.roundToInt
+          import kotlin.math.sqrt
+
+          class CancelledException : Exception()
+          class UpscaleException(message: String) : Exception(message)
+
+          class UpscaleEngine(private val context: Context) {
+
+              @Volatile
+              var cancelled = false
+
+              data class Output(val bitmap: Bitmap, val note: String?)
+
+              private class Ctx(
+                  val settings: UpscaleSettings,
+                  val hasAlpha: Boolean,
+                  val passTotal: Int,
+                  val onProgress: (Float) -> Unit
+              ) {
+                  var passDone = 0
+              }
+
+              fun upscale(input: Bitmap, settings: UpscaleSettings, onProgress: (Float) -> Unit): Output {
+                  val n = settings.model.nativeScale
+                  val target = settings.targetScale.toFloat()
+                  val peak = max(target, n.toFloat())
+
+                  var src = input
+                  var note: String? = null
+                  val peakPixels = src.width.toDouble() * src.height * peak * peak
+                  if (peakPixels > MAX_PIXELS) {
+                      val f = sqrt(MAX_PIXELS / peakPixels)
+                      val nw = max(16, (src.width * f).toInt())
+                      val nh = max(16, (src.height * f).toInt())
+                      src = Bitmap.createScaledBitmap(input, nw, nh, true)
+                      note = "input reduced to fit phone memory"
+                  }
+
+                  val ctx = Ctx(settings, input.hasAlpha(), countPasses(target, n), onProgress)
+                  try {
+                      val result = run(src, target, n, ctx)
+                      if (src !== input) src.recycle()
+                      return Output(result, note)
+                  } catch (e: OutOfMemoryError) {
+                      throw UpscaleException("Not enough memory. Use a smaller image or a lower scale.")
+                  }
+              }
+
+              private fun countPasses(t: Float, n: Int): Int = if (t > n) 1 + countPasses(t / n, n) else 1
+
+              /** Returns [src] upscaled by exactly [target] (rounded to whole pixels). */
+              private fun run(src: Bitmap, target: Float, n: Int, ctx: Ctx): Bitmap {
+                  val base = if (target > n) run(src, target / n, n, ctx) else src
+                  val out = nativePass(base, n, ctx)
+                  if (base !== src) base.recycle()
+                  val tw = max(1, (src.width * target).roundToInt())
+                  val th = max(1, (src.height * target).roundToInt())
+                  if (out.width == tw && out.height == th) return out
+                  val resized = Bitmap.createScaledBitmap(out, tw, th, true)
+                  if (resized !== out) out.recycle()
+                  return resized
+              }
+
+              private fun nativePass(inp: Bitmap, n: Int, ctx: Ctx): Bitmap {
+                  val s = ctx.settings
+                  val out = Bitmap.createBitmap(inp.width * n, inp.height * n, Bitmap.Config.ARGB_8888)
+                  if (ctx.hasAlpha) out.isPremultiplied = false
+
+                  val gpuOk = s.useGpu && NativeUpscaler.gpuCount() > 0
+                  val attempts = buildList<Pair<Int, Boolean>> {
+                      if (gpuOk) {
+                          var t = s.tile
+                          while (t >= 32) {
+                              add(t to true)
+                              t /= 2
+                          }
+                      }
+                      add(minOf(s.tile, 64).coerceAtLeast(32) to false)
+                  }
+
+                  for ((tile, gpu) in attempts) {
+                      if (cancelled) throw CancelledException()
+                      val cb = ProgressCallback { done, total ->
+                          ctx.onProgress((ctx.passDone + done.toFloat() / total) / ctx.passTotal)
+                          !cancelled
+                      }
+                      val rc = NativeUpscaler.upscale(
+                          context.assets, s.model.file, n, tile, gpu, inp, out, ctx.hasAlpha, cb
+                      )
+                      if (rc == 0) {
+                          ctx.passDone++
+                          return out
+                      }
+                      if (rc == -2) throw CancelledException()
+                  }
+                  out.recycle()
+                  throw UpscaleException("AI engine failed (GPU or memory). Try a smaller tile size or turn off GPU.")
+              }
+
+              companion object {
+                  private const val MAX_PIXELS = 30_000_000.0
+              }
+          }
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/ic_launcher_foreground.xml' <<'PB_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M54,28 L76,54 L63,54 L63,80 L45,80 L45,54 L32,54 Z" />
+              <path
+                  android:fillColor="#7FE0C3"
+                  android:pathData="M78,26 L81,33 L88,36 L81,39 L78,46 L75,39 L68,36 L75,33 Z" />
+          </vector>
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/res/mipmap-anydpi'
+          cat > 'app/src/main/res/mipmap-anydpi/ic_launcher.xml' <<'PB_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/res/values-night'
+          cat > 'app/src/main/res/values-night/themes.xml' <<'PB_END_OF_FILE'
+          <resources>
+              <style name="Theme.PixelBoost" parent="android:Theme.Material.NoActionBar" />
+          </resources>
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/ic_launcher_background.xml' <<'PB_END_OF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#1F5FD6</color>
+          </resources>
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/strings.xml' <<'PB_END_OF_FILE'
+          <resources>
+              <string name="app_name">PixelBoost</string>
+          </resources>
+          PB_END_OF_FILE
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/themes.xml' <<'PB_END_OF_FILE'
+          <resources>
+              <style name="Theme.PixelBoost" parent="android:Theme.Material.Light.NoActionBar" />
+          </resources>
+          PB_END_OF_FILE
+          cat > 'build.gradle.kts' <<'PB_END_OF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          PB_END_OF_FILE
+          cat > 'gradle.properties' <<'PB_END_OF_FILE'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          PB_END_OF_FILE
+          cat > 'settings.gradle.kts' <<'PB_END_OF_FILE'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PixelBoost"
+          include(":app")
+          PB_END_OF_FILE
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Download ncnn (Vulkan, Android)
+        run: |
+          curl -fL --retry 3 -o ncnn.zip https://github.com/Tencent/ncnn/releases/download/20240102/ncnn-20240102-android-vulkan.zip
+          unzip -q ncnn.zip
+          mv ncnn-20240102-android-vulkan app/src/main/cpp/ncnn
+          ls app/src/main/cpp/ncnn
+
+      - name: Download Real-ESRGAN models
+        run: |
+          mkdir -p app/src/main/assets/models
+          for m in realesrgan-x4plus realesrgan-x4plus-anime realesr-animevideov3-x2 realesr-animevideov3-x3 realesr-animevideov3-x4; do
+            for e in param bin; do
+              curl -fL --retry 3 -o "app/src/main/assets/models/$m.$e" "https://raw.githubusercontent.com/xinntao/Real-ESRGAN-ncnn-vulkan/master/models/$m.$e"
+              test -s "app/src/main/assets/models/$m.$e"
+            done
+          done
+          ls -la app/src/main/assets/models
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PixelBoost-APK
+          path: app/build/outputs/apk/debug/*.apk
